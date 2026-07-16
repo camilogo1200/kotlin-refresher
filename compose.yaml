@@ -1,0 +1,59 @@
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks:
+    - backend
+
+x-postgres-db: &postgres-db
+  <<: *service-defaults
+  healthcheck:
+    test: [ "CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
+    interval: 10s
+    timeout: 5s
+    retries: 10
+    start_period: 10s
+
+services:
+  redis:
+    <<: *service-defaults
+    image: ${REDIS_IMAGE}
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:${REDIS_PORT}:6379"
+    volumes:
+      - redis-data-store:/data
+    healthcheck:
+      test: [ "CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  bookstore-db:
+    <<: *postgres-db
+    image: ${BOOKSTORE_DB_IMAGE}
+    volumes:
+      - bookstore-db-data-store:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB: ${BOOKSTORE_DB_NAME}
+      - POSTGRES_PASSWORD: ${BOOKSTORE_DB_PASSWORD}
+      - POSTGRES_USER: ${BOOKSTORE_DB_USER}
+    ports:
+      - "127.0.0.1:${BOOKSTORE_DB_PORT}:5432"
+
+volumes:
+  redis-data-store:
+    name: ${REDIS_VOLUME}
+  bookstore-db-data-store:
+    name: ${BOOKSTORE_DB_VOLUME}
+
+networks:
+  backend:
+    driver: bridge
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
