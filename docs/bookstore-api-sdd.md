@@ -1,5 +1,5 @@
 # 📚 Bookstore API — Software Design Document
-### Kotlin 2.2+ · Java 17/21+ · Spring Framework 7 · Spring Boot 4 · Hexagonal Architecture
+### Kotlin 2.3 · Java 21 · Spring Framework 7 · Spring Boot 4.1 · Hexagonal Architecture
 
 > **Document type:** Scope-first SDD for a deliberately small, feature-dense backend.
 > **Dual purpose:** (1) a real, well-architected service specification and (2) a structured Kotlin + Spring Boot 4 refresher — every architectural decision doubles as an interview talking point.
@@ -33,17 +33,19 @@ The Bookstore API solves exactly this problem class: **centralize the business r
 
 ### 2.1 The second problem this project solves (the meta-scope)
 
-This codebase is *also* a **learning vehicle**: a Kotlin refresher targeting Spring Boot 4 / Spring Framework 7 APIs. The domain was chosen to be the smallest one that still forces contact with the features that dominate real API work and interviews:
+This codebase is *also* a **Kotlin-first learning vehicle** targeting Spring Boot 4 / Spring Framework 7 APIs. Plain Kotlin modeling, structured concurrency, `Deferred<T>`, cancellation, dispatchers, Flow, and coroutine testing are learned before Spring enters the curriculum. The domain then forces contact with the features that dominate real API work:
 
 | Real-world concern | Feature it forces you to exercise |
 |---|---|
-| Two aggregates with a relation | JPA mappings, `@OneToMany`, fetch strategies, N+1 |
+| Two aggregates with ownership | Spring Data JDBC aggregate mapping, `@MappedCollection`, explicit cross-aggregate references |
 | Money + identity invariants | `BigDecimal`, validation, unique constraints |
 | "Last copy" races | `@Transactional`, `@Version` optimistic locking |
 | Multiple clients, long-lived contract | DTOs, API versioning (native in Spring 7), ProblemDetail |
 | An external dependency | HTTP interface clients, `@Retryable`, resilience |
 | Someone has to run it | Actuator, MDC/correlation IDs, typed configuration |
 | Someone has to change it safely | Hexagonal boundaries, MockK, Testcontainers, ArchUnit |
+| Kotlin concurrency before frameworks | `Job`, `Deferred<T>`, `join`, `await`, `awaitAll`, structured cancellation, supervision, `runTest` (K0–K2) |
+| Blocking vs suspending vs non-blocking | suspend MVC + adapter-owned `withContext` vs virtual threads vs Spring Data R2DBC (M11) |
 
 Buildable in a handful of evenings; two aggregates (`Book`, `Order`) are enough for relations, transactions and business rules without drowning in domain complexity.
 
@@ -60,13 +62,13 @@ Buildable in a handful of evenings; two aggregates (`Book`, `Order`) are enough 
 - `POST /api/v1/orders` with `{ customerEmail, items: [{bookId, quantity}] }`:
   - validates the request shape (email format, positive quantities),
   - enforces **max items per order** (externalized, typed configuration),
-  - loads each book, verifies price against the external price-check service,
+  - verifies prices against the external service before opening the database transaction,
   - checks and **atomically decrements stock** for every line item,
   - computes the total server-side (client-supplied totals are never trusted),
   - persists order + items in **one transaction** — any failure rolls back everything,
   - resolves concurrent conflicts on the same book via optimistic locking → `409 Conflict`.
 - `GET /api/v1/orders/{id}` returns the order with its items (no lazy-loading leaks).
-- Order lifecycle: `CREATED → PAID | CANCELLED` (stored as `STRING`, never `ORDINAL`).
+- Order lifecycle: `CREATED → PAID | CANCELLED` (stored through an explicit stable-string converter, never an ordinal).
 
 ### 3.3 Operational surface
 - Health, info and metrics via Actuator (only those three exposed).
@@ -74,13 +76,33 @@ Buildable in a handful of evenings; two aggregates (`Book`, `Order`) are enough 
 - Machine-readable errors: every non-2xx response is an RFC 9457 `ProblemDetail`.
 - One endpoint demonstrates Spring 7 **native API versioning** (`version = "1.1"` mapping) so the evolution story is proven, not theoretical.
 
-### 3.4 Explicit non-goals (out of scope)
-- Payments, shipping, tax, multi-currency — `PAID` is a status flip, not a gateway integration.
+### 3.4 Coroutine application and runtime comparison (K0–K2, M11)
+- K0–K2 establish the pure Kotlin model before Spring: `Deferred<T>.join()` vs `await()`, `awaitAll`, structured failure, supervision, cancellation, dispatcher ownership, cold Flow, and `runTest`.
+- `GET /api/v1/books/{isbn}/enriched` — book + verified price + rating, fanned out with `suspend` + `coroutineScope`/`async`; the blocking `CompletableFuture`/virtual-thread version is the comparison.
+- `GET /api/v1/books/stream?author=` — streaming catalog search returning `Flow<BookResponse>` as NDJSON.
+- A second simulated external, the **rating service**, exists so the fan-out has real siblings to race and cancel.
+- An `r2dbc-comparison` branch replicates the catalog read path on **Spring Data R2DBC** (`CoroutineCrudRepository`, suspend + `Flow` end to end) — see ADR-012.
+
+### 3.5 Core-service non-goals
+- Real payments, shipping, tax, multi-currency — `PAID` is a status flip in the core application, not a gateway integration.
 - Authentication/authorization (Spring Security is its own refresher project; the architecture leaves a clean seam for it in the web adapter).
-- Event-driven anything (outbox, Kafka), microservices, CQRS, caching-as-correctness.
+- Kafka, distributed Sagas, and event sourcing are not runtime dependencies of the core monolith.
 - Frontend, admin UI, reporting.
 
-Cutting these is what keeps the project honest: **small surface, production-grade depth.**
+Cutting these is what keeps the core service honest: **small surface, production-grade depth.**
+
+### 3.6 Companion learning systems (separate scopes)
+
+The split curriculum deliberately grows beyond the core SDD without pretending every technology belongs in one deployable application:
+
+| Companion | Business purpose | Main techniques |
+|---|---|---|
+| Fulfillment API | Own shipment/tracking lifecycle and live customer updates | WebFlux, Kotlin `Flow`, SSE, R2DBC, carrier webhooks |
+| Kafka/EDA track | Move committed facts from modules to independent consumers | Spring Modulith, publication registry/outbox, Kafka, inbox/idempotency, consumer groups |
+| Distributed checkout | Coordinate order, inventory, simulated payment authorization, and fulfillment | Choreographed and orchestrated Sagas, compensation, deadlines, recovery |
+| Fulfillment event-sourcing lab | Reconstruct a naturally chronological aggregate and rebuild query models | Append-only event store, expected version, CQRS projections, snapshots/evolution |
+
+The simulated payment service accepts only a provider token; card data is never in scope. These companion systems have their own problem statements, acceptance criteria, and definitions of done under [`docs/bookstore-tour`](bookstore-tour/README.md).
 
 ## 4. Actors and external systems
 
@@ -90,7 +112,8 @@ Cutting these is what keeps the project honest: **small surface, production-grad
 | Storefront / ordering client | Browses catalog, places orders |
 | Operations / SRE | Actuator endpoints, structured logs |
 | **External price-check service** (simulated) | Outbound HTTP call during order placement — exists to force an outbound-adapter + resilience story |
-| PostgreSQL 16 | Owned exclusively by this service; schema evolved only via Flyway |
+| **External rating service** (simulated, M11) | Second outbound call — exists so parallel fan-out (`async` vs `CompletableFuture`) has real siblings to race and cancel |
+| PostgreSQL 18 | Owned exclusively by this service; schema evolved only via Flyway |
 
 ## 5. Quality attributes (the "-ilities" that drove the architecture)
 
@@ -106,16 +129,16 @@ Cutting these is what keeps the project honest: **small surface, production-grad
 
 ## 6. Architectural style: Hexagonal (Ports & Adapters), package-enforced
 
-The system follows **hexagonal architecture** (Alistair Cockburn, 2005), which is Clean Architecture's most practical incarnation for a Spring service: the **domain core** sits in the middle knowing nothing about HTTP, JPA or Spring; everything technical is an **adapter** plugged into a **port** (a Kotlin interface owned by the core). Dependencies point strictly inward.
+The system follows **hexagonal architecture** (Alistair Cockburn, 2005), a practical Clean Architecture shape for a Spring service. The **domain** is plain Kotlin. Application use cases own input/output ports and intentionally use Spring's `@Service` stereotype; adapters provide HTTP, JDBC, and remote-client implementations. Dependencies still point inward: allowing a focused Spring annotation is not permission for application code to import adapter types.
 
 ```
             ┌──────────────────────────────────────────────────┐
   driving   │                    adapters                      │  driven
   (input)   │  ┌────────────────────────────────────────────┐  │  (output)
             │  │              application                   │  │
- REST ──────┼─▶│  input ports   ┌──────────┐  output ports  │◀─┼────── JPA/Postgres
+ REST ──────┼─▶│  input ports   ┌──────────┐  output ports  │◀─┼────── JDBC/Postgres
  controller │  │  (use cases)   │  domain  │  (interfaces)  │  │
-            │  │                │ Book,    │                │◀─┼────── RestClient →
+            │  │                │ Book,    │                │◀─┼────── WebClient →
  (future:   │  │  PlaceOrder    │ Order,   │ BookRepository │  │       price service
   GraphQL,  │  │  ManageBooks   │ rules    │ PriceGateway   │  │
   CLI, MQ)  │  └────────────────└──────────┘────────────────┘  │
@@ -127,32 +150,56 @@ The system follows **hexagonal architecture** (Alistair Cockburn, 2005), which i
 
 | Layer | May depend on | Must NOT depend on |
 |---|---|---|
-| `domain` | Kotlin stdlib, `java.time`, `java.math` | Spring, JPA, Jackson, anything in `adapter.*` |
-| `application` | `domain` (+ minimal Spring for `@Transactional` — see ADR-006) | web, persistence, HTTP client classes |
-| `adapter.in.web` | `application` ports, `domain` types it maps | `adapter.out.*` |
-| `adapter.out.persistence` / `adapter.out.pricing` | the output-port interfaces + `domain` | `adapter.in.*` |
+| `domain` | Kotlin stdlib, `java.time`, `java.math` | Spring, Jakarta, Spring Data, Jackson, application/adapters |
+| `application` | `domain`, port contracts, `kotlinx-coroutines-core`, Spring stereotypes such as `@Service` | web, persistence rows/repositories, HTTP client types, bootstrap |
+| `adapter.input.http` | application input ports, DTO/mapping concerns, Spring MVC/validation | output-adapter implementation types |
+| `adapter.output.*` | application output ports + domain, Spring Data/client technology | input adapters |
+| `bootstrap` | every ring for wiring/configuration only | business rules |
 
 ### 6.1 Package layout (single Gradle module — see ADR-002)
 
 ```
-com.example.bookstore
-├── domain/                        # pure Kotlin — zero framework imports
-│   ├── model/          Book.kt, Order.kt, OrderItem.kt, OrderStatus.kt, Isbn.kt
-│   └── error/          BookNotFoundException.kt, InsufficientStockException.kt, ...
-├── application/
-│   ├── port/
-│   │   ├── in/         PlaceOrderUseCase.kt, ManageBooksUseCase.kt, QueryBooksUseCase.kt
-│   │   └── out/        BookRepositoryPort.kt, OrderRepositoryPort.kt, PriceCheckPort.kt
-│   └── service/        PlaceOrderService.kt, BookService.kt          # implement input ports
-├── adapter/
-│   ├── in/web/         BookController.kt, OrderController.kt, dto/, GlobalExceptionHandler.kt
-│   └── out/
-│       ├── persistence/ BookJpaEntity.kt, SpringDataBookRepository.kt, BookPersistenceAdapter.kt
-│       └── pricing/     PriceCheckClient.kt (HTTP interface), PriceCheckAdapter.kt
-└── infrastructure/     BookstoreApplication.kt, config/, logging/ (MDC filter), OrderProperties.kt
+com.example.kotlinrefresher
+├── bootstrap/                              # @SpringBootApplication, @Configuration, @Bean, properties
+├── catalog/
+│   ├── domain/                             # Book, Isbn, stock behavior/errors; zero Spring
+│   ├── application/
+│   │   ├── port/input/                     # ManageBooksUseCase, QueryBooksUseCase
+│   │   ├── port/output/                    # BookRepositoryPort
+│   │   ├── usecase/                        # @Service implementations
+│   │   └── error/                          # BookNotFound, DuplicateIsbn
+│   └── adapter/
+│       ├── input/http/                     # @RestController, DTOs, advice
+│       └── output/persistence/jdbc/         # @Repository adapter, BookRow, internal Spring Data repo
+├── ordering/
+│   ├── domain/                             # Order, OrderItem, order invariants
+│   ├── application/
+│   │   ├── port/input/                     # PlaceOrderUseCase
+│   │   ├── port/output/                    # PriceCheckPort, OrderCommitPort, RatingPort
+│   │   └── usecase/                        # @Service PlaceOrderService, EnrichBookService
+│   └── adapter/
+│       ├── input/http/                     # @RestController OrderController
+│       └── output/
+│           ├── persistence/jdbc/            # @Repository + imperative @Transactional delegate
+│           ├── pricing/                     # @Component HTTP client adapter
+│           └── rating/                      # @Component rating adapter
+└── shared/                                  # only genuinely shared domain/application primitives
 ```
 
-Boundaries are **enforced by ArchUnit tests** (M9), not by convention and good intentions.
+This feature-first layout keeps a growing codebase navigable without losing hexagonal rings. `input`/`output` are used instead of `in`/`out` because `in` is a hard Kotlin keyword. Boundaries are **enforced by ArchUnit tests** (M9), not by convention. On the `r2dbc-comparison` branch, the persistence output adapter changes while input ports and domain behavior remain stable.
+
+### 6.2 Spring annotation policy
+
+| Annotation | Allowed role |
+|---|---|
+| `@RestController` / `@RestControllerAdvice` | HTTP input adapters |
+| `@Service` | Application use-case implementations |
+| `@Repository` | Persistence output adapters; semantic role/scanning here, with synchronous Spring Data proxies providing JDBC exception translation |
+| `@Component` | Non-persistence output adapters and infrastructure collaborators when no specific stereotype fits |
+| `@Configuration`, `@Bean`, `@ConfigurationProperties` | Bootstrap/configuration |
+| Spring/Jakarta/Data annotations | **Never in domain** |
+
+Spring Data repository interfaces are discovered automatically and stay `internal`; adding `@Repository` to them is redundant. Constructor injection is mandatory. No field injection, `lateinit`, service locator, or static application context access.
 
 ---
 
@@ -162,11 +209,11 @@ Each ADR: context → decision → why → what you learn defending it.
 
 ### ADR-001 · Hexagonal over classic three-layer — with eyes open
 
-**Context.** The default Spring tutorial layout (`controller → service → repository`) works, but the "service" layer inevitably accumulates HTTP concerns, JPA concerns and business rules in one place, and the domain ends up shaped like the database.
+**Context.** The default Spring tutorial layout (`controller → service → repository`) works, but a global service layer easily accumulates HTTP, persistence, and business concerns, and the domain ends up shaped like database rows.
 
-**Decision.** Ports & adapters, with a **framework-free domain**: the `domain` package compiles with zero Spring/JPA imports, and business rules are testable with plain JUnit in milliseconds.
+**Decision.** Feature-first ports & adapters, with a **framework-free domain** and Spring-annotated application/adapters according to section 6.2. Domain rules remain testable with plain JUnit in milliseconds; `@Service` use cases are also instantiated directly in unit tests without a Spring context.
 
-**Honest cost accounting** (this is the part interviewers respect): hexagonal buys you replaceable technology, isolated tests and deferred decisions — and charges you **mapping boilerplate** (JPA entity ↔ domain model), more files, and team discipline. For a trivial CRUD app it is overkill; the practitioner consensus is that it pays off when there is real business logic, multiple interfaces, or long-term maintenance — which is precisely what we're simulating, and why it's worth learning on a small codebase where the pattern stays visible.
+**Honest cost accounting:** hexagonal buys replaceable technology, isolated tests and deferred decisions — and charges mapping boilerplate, more files, and team discipline. For trivial CRUD it is overkill; this project has concurrency rules, remote dependencies, and two persistence variants, so the ports perform real work.
 
 **🎤 Talking point:** "Hexagonal isn't about the folder names. It's one rule — *dependencies point inward* — plus interfaces at the boundaries so I can compile and test the business core without booting a framework."
 
@@ -185,7 +232,7 @@ Each ADR: context → decision → why → what you learn defending it.
 
 **Decision.** (1) always; (2) never.
 
-- **Output ports are mandatory.** `BookRepositoryPort` and `PriceCheckPort` are Kotlin interfaces *owned by the application layer*; the JPA adapter and the HTTP adapter implement them. This is the **Dependency Inversion Principle** doing real work: the core defines the contract, infrastructure conforms to it, and in tests you substitute a fake in one line.
+- **Output ports are mandatory.** `BookRepositoryPort`, `OrderCommitPort`, and `PriceCheckPort` are Kotlin interfaces *owned by the application layer*; JDBC/R2DBC and HTTP adapters implement them. This is the **Dependency Inversion Principle** doing real work.
 - **Input ports (use-case interfaces) are included here for the learning value** — they make the "what does this system do?" list greppable (`PlaceOrderUseCase`) and keep controllers ignorant of implementation classes. Know the counter-argument: many production teams skip them and let controllers call application services directly, because controller → service already points inward. Skipping input ports is a defensible pragmatic trim; skipping output ports collapses the architecture.
 - **`ServiceImpl` pairs add nothing**: Spring has proxied concrete classes via CGLIB for a decade (that's what `plugin.spring`/all-open is for), MockK mocks final classes, and a single-implementation interface in the same package is speculative generality. Add an interface *within* a layer only when a second implementation or a boundary actually exists.
 
@@ -197,71 +244,98 @@ Each ADR: context → decision → why → what you learn defending it.
 |---|---|
 | **S**RP | Controllers translate HTTP only; use-case services orchestrate one business operation each; adapters translate technology. A change in JSON shape, business rule, or SQL touches exactly one place. |
 | **O**CP | Adding a GraphQL API or swapping Postgres for Mongo = new adapter implementing an existing port; zero edits to `domain`/`application`. |
-| **L**SP | Every `BookRepositoryPort` implementation (JPA adapter, in-memory test fake) must honor the same contract — e.g., `findByIsbn` returns `null` (not throws) when absent. Test fakes that cheat the contract are LSP violations that poison your tests. |
+| **L**SP | Every `BookRepositoryPort` implementation (JDBC adapter, R2DBC adapter, test fake) honors the same nullable/suspend contract. Test fakes that cheat it poison tests. |
 | **I**SP | Ports are role-shaped and small (`PriceCheckPort` has one method), so no adapter is forced to stub methods it doesn't serve. |
-| **D**IP | High-level policy (`PlaceOrderService`) depends on abstractions it owns (`out` ports); low-level detail (JPA, RestClient) depends on those abstractions. Constructor injection of `val` port references makes the graph explicit and immutable. |
+| **D**IP | High-level policy (`PlaceOrderService`) depends on output ports it owns; low-level JDBC/R2DBC/WebClient details implement those abstractions. Constructor injection of `val` references makes the graph explicit. |
 
-### ADR-005 · Domain model separate from JPA entities
+### ADR-005 · Domain model separate from Spring Data rows
 
-**Context.** The single sharpest tension in "hexagonal + Spring Data JPA": JPA's whole value proposition is *one* annotated model, while hexagonal wants persistence-ignorant domain objects. Respected practitioners note that keeping JPA annotations on your domain objects quietly undermines the architecture — the ORM starts dictating your design (mutable `var`s, nullable ids, no-arg constructors, open classes).
+**Context.** Spring Data JDBC can map Kotlin classes directly, but using the same type for business behavior and storage still lets table concerns, nullable generated ids, versions, and aggregate serialization shape the domain.
 
-**Decision.** Separate them. `domain.model.Book` is a proper Kotlin class enforcing its own invariants (`init { require(price > BigDecimal.ZERO) }`); `adapter.out.persistence.BookJpaEntity` is the JPA-shaped mutable class; the persistence adapter maps between them with extension functions (`fun BookJpaEntity.toDomain(): Book`).
+**Decision.** Separate them. `catalog.domain.Book` enforces invariants; `BookRow` is an immutable `@Table` data class in the JDBC adapter. Internal extension functions map between them. The R2DBC comparison gets its own row type without changing the domain.
 
-**Consequence accepted:** mapping boilerplate for two aggregates. That's the tuition for this lesson — and you'll be able to articulate *exactly* why teams sometimes take the pragmatic shortcut (entities-as-domain) and what they give up.
+**Consequence accepted:** mapping boilerplate for two aggregates. It is small, explicit, and prevents persistence annotations from crossing into domain.
 
-### ADR-006 · `@Transactional` lives on application services (a documented leak)
+### ADR-006 · Spring stereotypes are intentional; JDBC transactions remain imperative internally
 
-**Context.** Order placement must be atomic. But `@Transactional` is a Spring annotation, and the application layer is supposed to be framework-light. Purists wrap transactions behind a port or decorator; pragmatists annotate the use-case service.
+**Context.** The user wants normal Spring annotation-driven code, while Kotlin coroutines can resume on different threads and JDBC transactions are thread-bound. Remote price calls must not occur while a DB transaction holds connections/locks.
 
-**Decision.** Annotate `PlaceOrderService.place()` with `@Transactional` and record it as a **conscious, contained exception** to framework-freedom: it's declarative metadata, not control flow, and the alternative machinery costs more than it teaches. The *domain* stays pure; the application layer accepts two Spring imports (`@Transactional`, stereotype for scanning).
+**Decision.** `PlaceOrderService` is an `@Service` with a suspending method. It performs remote quote fan-out, then invokes `OrderCommitPort`. `JdbcOrderCommitAdapter` is an `@Repository`; inside `withContext(jdbcDispatcher)` it calls a separate proxied bean with an imperative `@Transactional` method. That method loads/version-checks aggregates, runs domain behavior, and writes atomically without a suspension point. The R2DBC adapter uses a reactive transaction manager for its suspend implementation.
 
 **🎤 Talking points (unchanged interview gold):**
 - Proxy-based ⇒ **self-invocation bypasses the transaction** (`this.otherTxMethod()` never hits the proxy).
 - Default rollback: unchecked only. Kotlin has no checked exceptions, but Spring still applies the Java rule *by exception type* — a Kotlin function throwing `IOException` will NOT roll back by default. Know `rollbackFor`.
-- `readOnly = true` on queries: skips dirty checking, can hint replica routing.
+- `readOnly = true` expresses intent and may enable driver/database optimizations; Data JDBC has no Hibernate dirty-checking session.
 
-### ADR-007 · Concurrency: blocking MVC + virtual threads by default; coroutines where they earn it
+### ADR-007 · Concurrency: Kotlin coroutines are the main line; virtual threads are the comparison
 
-**Context (the question you actually asked).** Kotlin coroutines vs Java 21+ virtual threads is *the* 2026 concurrency interview topic, and this app has to pick.
+**Context (the question you actually asked).** Kotlin coroutines vs Java 21+ virtual threads is *the* 2026 concurrency interview topic — and "pick a winner" is the wrong frame. There are three independent dials: **code shape** (`suspend`/`Flow` signatures vs plain blocking ones), **runtime** (virtual threads make blocking cheap), and **driver** (JDBC blocks; R2DBC doesn't). A learning project should turn each dial separately and diff the results.
 
-**Decision.** **Spring MVC, blocking style, with `spring.threads.virtual.enabled=true`.** One stretch milestone (M10) converts the outbound price-check orchestration to `suspend` functions to feel the difference.
+**Decision.** K0–K2 teach coroutines before Spring. Suspend MVC/use-case/output-port contracts are the main line. M11 applies them to Spring and then builds the blocking virtual-thread comparison.
 
-**Why virtual threads are the default here:**
-- The hot path is **JPA/JDBC — a blocking API**. Coroutines don't make JDBC non-blocking; they'd just shuffle the blocking onto another thread pool. Virtual threads make the blocking *cheap* with **zero code changes** — the thread-per-request model simply stops costing an OS thread per request.
-- Boot enables it with one property; every `RestClient` call, every repository call scales without `suspend` coloring your entire call stack.
-- Spring 7's new `@ConcurrencyLimit` (resilience moved into the framework, alongside `@Retryable`) is designed with virtual threads in mind — unbounded cheap threads still need bulkheads around scarce resources like DB connection pools.
+- **Track A — Kotlin-first main line:** suspend MVC and ports, `coroutineScope { async {} }` fan-out, adapter-owned `withContext(jdbcDispatcher)` for Data JDBC, Flow only for streaming contracts, and R2DBC where IO becomes truly non-blocking.
+- **Track B — imperative comparison:** blocking MVC/Data JDBC with `spring.threads.virtual.enabled=true`, `CompletableFuture` only for the explicit comparison, and ordinary pagination.
 
-**Where coroutines win — and when you'd flip the decision:**
-- **Structured concurrency**: fanning out several remote calls with automatic cancellation of siblings on failure (`coroutineScope { async{} async{} }`) is where coroutines are genuinely superior; virtual threads need explicit `StructuredTaskScope` for comparable lifecycle guarantees.
-- A **truly reactive stack** (WebFlux + R2DBC): Kotlin coroutines are the idiomatic face of it (`Flow`, suspending repositories) — far more readable than raw Reactor.
-- The honest 2026 summary: for a typical blocking MVC + JPA service the throughput difference is academic; virtual threads = scale without rewriting, coroutines = structured concurrency and cancellation when your code composes many async steps. Also note they compose: coroutines can dispatch onto virtual threads (`Executors.newVirtualThreadPerTaskExecutor().asCoroutineDispatcher()`).
+**The fan-out pair, condensed** (M11 builds it in full):
 
-**🎤 Talking point:** "Suspending is a property of the *code*; virtual threads are a property of the *runtime*. My JPA app blocks either way, so I let the runtime absorb it. I'd reach for coroutines the moment I'm composing multiple remote calls and need structured cancellation, or if I were on R2DBC."
+```kotlin
+// Track A — structured: rating fails ⇒ price is cancelled, scope rethrows. Guaranteed.
+suspend fun enrich(isbn: String): EnrichedBook = coroutineScope {
+    val price  = async { priceCheckPort.currentPrice(Isbn(isbn)) }
+    val rating = async { ratingPort.rating(isbn) }
+    EnrichedBook(price.await(), rating.await())
+}
+```
 
-### ADR-008 · HTTP client: `RestClient` + declarative HTTP interfaces — not Retrofit
+```kotlin
+// Track B — unstructured: rating fails ⇒ price keeps running unless you cancel it yourself.
+fun enrich(isbn: String): EnrichedBook {
+    val price  = CompletableFuture.supplyAsync({ blockingPriceCheckPort.currentPrice(Isbn(isbn)) }, vtExecutor)
+    val rating = CompletableFuture.supplyAsync({ blockingRatingPort.rating(isbn) }, vtExecutor)
+    return EnrichedBook(price.join(), rating.join())
+}
+```
+
+Track B uses explicit imperative comparison ports; a `CompletableFuture` supplier cannot call a suspending port. The executor is injected from bootstrap and closed by the container, not allocated inside the service.
+
+**How JDBC fits Track A:** coroutines do not make JDBC non-blocking. The `@Repository` adapter owns an injected `Dispatchers.IO.limitedParallelism(n)` view, while its imperative `@Transactional` delegate stays on one thread. `Dispatchers.IO` defaults to 64 or the processor count, whichever is larger, and its limited views are elastic; the connection pool remains the hard resource boundary. Track B instead uses virtual threads to reduce the cost of the same blocking waits.
+
+**What Track A buys, and its named costs:**
+- **Cancellation by construction** (the code pair above). Java's answer, `StructuredTaskScope`, is still in preview as of Java 25.
+- **Streaming:** `Flow<T>` is cold, backpressured, cancellable; on NDJSON/SSE Spring serializes elements as they arrive — on plain `application/json` the flow is silently *collected* first. The media type decides.
+- **Composition with virtual threads:** `Executors.newVirtualThreadPerTaskExecutor().asCoroutineDispatcher()` — suspend-shaped code, Loom-cheap blocking. The tracks stack; they don't compete.
+- **Costs:** `suspend` colors contracts and `kotlinx-coroutines-core` enters application. MVC needs `kotlinx-coroutines-reactor`. Boot/Micrometer automatic context propagation is enabled for observability; custom MDC keys need an accessor or explicit `MDCContext`. JDBC transactions remain imperative behind the adapter; R2DBC uses reactive transaction context.
+
+**🎤 Talking point:** "Suspending is a property of code, virtual threads of the runtime, and blocking of the driver. My main line uses structured coroutines, isolates JDBC blocking in an adapter, and changes only that adapter when R2DBC removes the block."
+
+### ADR-008 · HTTP client: WebClient-backed reactive interface behind a suspend port; RestClient comparison
 
 **Context (your other question).** For the outbound price-check call the candidates are Retrofit, `RestTemplate`, `WebClient`, `RestClient`, and Spring 6/7's declarative HTTP interfaces.
 
-**Decision.** A declarative **HTTP interface** (`@GetExchange` on a Kotlin interface) backed by **`RestClient`**, registered with Boot 4's `@ImportHttpServices` — which reduces the old manual `HttpServiceProxyFactory` wiring to a single annotation.
+**Decision.** The application owns a suspending `PriceCheckPort`. The WebClient-backed technical HTTP interface (`@GetExchange`) returns `Mono<PriceQuote>` and is registered as a Boot HTTP-service group. The adapter awaits that publisher, so Reactor stays outside the application boundary. This shape also lets Spring Framework's reactive `@Retryable` interceptor decorate the actual asynchronous pipeline. M11 builds the blocking RestClient-backed interface for comparison.
 
 **The elimination round:**
 - **`RestTemplate`** — maintenance mode; feature-frozen. Legacy code only.
-- **`WebClient`** — brings the entire reactive stack (Reactor, `Mono`/`Flux`) into a blocking servlet app for no benefit. Only justified on WebFlux.
-- **Retrofit** — a genuinely good library, and the *inspiration* for Spring's HTTP interfaces (both are "annotated interface → generated client"). But in a Spring Boot 4 service it's a guest: you hand-wire OkHttp, converters and factories, add a dependency surface, and forfeit native integration. Spring's own HTTP interfaces give you the identical declarative ergonomics **natively**, participate in Boot auto-configuration and test support, ride on `RestClient` (so they're virtual-thread-friendly and reactive-free), and in Spring 7 even support **API versioning at the client** via `ApiVersionInserter` and per-group configuration (`HttpServiceGroupConfigurer`). Retrofit remains the right answer on Android; on the server, the framework caught up.
-- Bonus: Spring 7 lets you slap **`@Retryable`** (now in-framework, with backoff + jitter) and `@ConcurrencyLimit` on the adapter method — resilience without importing resilience4j for simple cases.
+- **`WebClient`** — correct here because the port suspends; Spring MVC may use a reactive client without exposing Reactor types from controllers.
+- **`RestClient`** — correct for an intentionally blocking port/virtual-thread track.
+- **Retrofit** — good on Android, but Spring HTTP interfaces provide native server-side integration, service groups, testing, and version insertion.
+- Spring 7's **`@Retryable`** lives on a separate proxied adapter collaborator returning `Mono` and requires `@EnableResilientMethods`.
+- A coroutine `Semaphore.withPermit` is the suspend main line's bulkhead. `@ConcurrencyLimit` belongs on the synchronous RestClient/virtual-thread comparison; putting it on `suspend fun` would release the invocation guard at suspension rather than hold a permit for the operation.
 
 ```kotlin
-interface PriceCheckClient {                      // adapter.out.pricing
+interface PriceCheckClient {
     @GetExchange("/prices/{isbn}")
-    fun currentPrice(@PathVariable isbn: String): PriceQuote
+    fun currentPrice(@PathVariable isbn: String): Mono<PriceQuote>
 }
 
 @Configuration
-@ImportHttpServices(PriceCheckClient::class)      // Boot 4: that's the whole wiring
+@ImportHttpServices(group = "pricing", types = [PriceCheckClient::class])
 class HttpClientsConfig
 ```
 
-The application core never sees this interface — it sees `PriceCheckPort`; `PriceCheckAdapter` implements the port and delegates to the generated client. Swap Retrofit in later and *nothing* inside the hexagon changes — which is the architecture proving its worth.
+The application core never sees this interface — it sees `PriceCheckPort`; `PriceCheckAdapter` uses `awaitSingle()` inside a coroutine `Semaphore.withPermit` block. A separate `@Component` owns the reactive `@Retryable` method so the call crosses a proxy. Swap Retrofit in later and *nothing* inside the hexagon changes — which is the architecture proving its worth.
+
+Add `spring-boot-starter-webclient` and configure `spring.http.serviceclient.pricing.base-url` plus timeouts in bootstrap. The application sees only `PriceCheckPort`; it never imports `Mono`, the HTTP interface, or WebClient.
 
 ### ADR-009 · API contract: DTOs, ProblemDetail, capped paging, native versioning
 
@@ -270,63 +344,102 @@ The application core never sees this interface — it sees `PriceCheckPort`; `Pr
 - **Paging** accepts `Pageable`, returns mapped `Page<BookResponse>`, caps size at 100 (pagination-DoS). Hexagonal nuance worth knowing: passing Spring's `Pageable` through the input port leaks framework into the core — the strict fix is your own small `PageQuery` type; teams often accept the leak for query-only paths. We define `PageQuery` (it's ~5 lines) and say why.
 - **Versioning**: URL prefix `/api/v1` as the coarse contract, *plus* one endpoint demonstrating Spring 7's first-class versioning — `@GetMapping(version = "1.1")` with an `ApiVersionConfigurer` strategy (path/header/query/media-type all supported, with RFC 9745 deprecation signaling). This feature is new headline material in Framework 7; showing it in a portfolio project is cheap and differentiating.
 
-### ADR-010 · Persistence, schema and Kotlin/JPA discipline
+### ADR-010 · Spring Data JDBC, Flyway, and Kotlin persistence discipline
 
-- **Flyway owns the schema**; `spring.jpa.hibernate.ddl-auto=validate`. "I never let Hibernate generate schema in prod" remains a free interview point.
+- **Flyway owns the schema.** Data JDBC does no DDL generation/validation; Testcontainers integration tests prove mappings against migrated Postgres.
 - Money = `NUMERIC(10,2)` ↔ `BigDecimal`. Never `Double`.
-- JPA entities are **normal classes with `var`s, never `data class`es** — generated `equals`/`hashCode` over mutable + DB-generated fields breaks identity across the persistence lifecycle, `toString` can detonate lazy associations, `copy()` invites detached duplicates. Data classes: DTOs yes, entities no.
-- `@Version` on the book entity ⇒ optimistic locking ⇒ concurrent last-copy purchase resolves as `ObjectOptimisticLockingFailureException` → mapped to `409`.
-- Kotlin build plugins are load-bearing, not boilerplate: `plugin.spring` (all-open, because Spring proxies by subclassing and Kotlin is final-by-default) and `plugin.jpa` (no-arg constructors for Hibernate's reflective instantiation).
+- JDBC rows are immutable `@Table` data classes inside the adapter; domain objects remain separate. `@MappedCollection` expresses aggregate ownership; references across aggregates are ids.
+- Spring Data `@Version` ⇒ optimistic locking ⇒ concurrent last-copy purchase resolves as `OptimisticLockingFailureException` → `409`.
+- The main line needs `plugin.spring` for proxied annotated beans, not `plugin.jpa`. The JPA plugin appears only in the optional ORM comparison.
 - **Null-safety at the boundary:** Boot 4 / Framework 7 completed the migration to **JSpecify** annotations, and Kotlin 2.1+ translates them into real Kotlin nullability — Spring API returns are `User?`, not platform types. Keep `-Xjsr305=strict` for remaining third-party libs. This is *the* Kotlin-specific "why Boot 4 matters" line.
 
 ### ADR-011 · Testing strategy = the architecture, verified
 
 | Ring | Tooling | What it proves |
 |---|---|---|
-| Domain | Plain JUnit 5 — **no Spring, no mocks** | Business invariants; runs in ms |
-| Application | MockK fakes/mocks of *ports* | Orchestration + business exceptions; `every`/`verify`/`slot` |
+| Kotlin runway | `kotlinx-coroutines-test` + JUnit Jupiter | join/await, cancellation, supervision, Flow, virtual time |
+| Domain | Plain JUnit Jupiter — **no Spring, no mocks** | Business invariants; runs in ms |
+| Application | MockK fakes/mocks of *ports* | Suspend orchestration with `coEvery`/`coVerify`; business errors |
 | Web adapter | `@WebMvcTest` + mocked input port | Status codes, JSON shape, validation 400s, ProblemDetail shape |
-| Persistence adapter | `@DataJpaTest` + **Testcontainers Postgres** via `@ServiceConnection` | Real SQL, real constraints (H2 lies) |
+| Persistence adapter | `@DataJdbcTest` + **Testcontainers Postgres** via `@ServiceConnection` | Real SQL, aggregate mapping, constraints, versions |
 | Whole hexagon | `@SpringBootTest` + Testcontainers | Place-order flow incl. rollback & optimistic-lock 409 |
 | Architecture | **ArchUnit** | The dependency rule itself |
 
 MockK over Mockito stays the Kotlin answer: final classes, `suspend` functions, extension functions, Kotlin DSL.
 
+### ADR-012 · The R2DBC branch line: same domain, non-blocking driver (M11)
+
+**Context.** Coroutines over Data JDBC still isolate rather than eliminate blocking. The `r2dbc-comparison` branch makes the catalog read path non-blocking with Spring Data R2DBC.
+
+**Decision.** Data JDBC remains the main line. The branch swaps the persistence adapter for `CoroutineCrudRepository`, suspend derived queries, and Flow returns. Flyway keeps a JDBC URL because startup migrations need not be reactive. Do not configure JDBC and R2DBC repositories for the same aggregate in the learning branch.
+
+```kotlin
+@Table("books")                       // Spring Data annotations — jakarta.persistence appears nowhere
+data class BookR2dbcRow(
+    @Id val id: Long? = null,
+    val isbn: String, val title: String, val author: String,
+    val price: BigDecimal, val stock: Int,
+    @Version val version: Long = 0,
+)
+
+interface CoroutineBookRepository : CoroutineCrudRepository<BookR2dbcRow, Long> {
+    suspend fun findByIsbn(isbn: String): BookR2dbcRow?
+    fun findByAuthorContainingIgnoreCase(author: String): Flow<BookR2dbcRow>
+}
+```
+
+**What flips relative to ADR-010:**
+- The row stays immutable; the repository signature and driver change.
+- Explicit aggregates, joins, and saves remain explicit — R2DBC changes IO, not relational modeling.
+- **`@Version` optimistic locking survives** — the last-copy race still resolves as one success + one `OptimisticLockingFailureException` → the same 409 contract. The consistency story is driver-independent, which is precisely why it lives behind a port.
+- **`@Transactional` works on `suspend` functions here**, because the reactive transaction manager propagates through the coroutine context instead of a ThreadLocal — order placement stays atomic on this track too.
+- Ports on this track are suspend/`Flow`-shaped — ADR-007's "color reaches the contract" lesson, now enforced by the compiler.
+
 ---
 
 # PART III — BUILD PLAN (the learning curve, in order)
 
-Same strategy as before — milestone-driven, each one refreshing a named cluster of features — but the sequence now *follows the architecture inward-out*: domain first (pure Kotlin), then ports, then adapters. You experience the payoff of hexagonal instead of reading about it: **M1 and M2 compile and pass tests before Spring Web or JPA exist in the project.**
+The sequence is intentionally Kotlin-first: K0–K2 teach language/concurrency with no Spring context; M1 applies the language to a pure domain; M2 introduces Spring-annotated application services; only then do adapters arrive.
+
+The executable lesson sequence is split into context-first files under [`bookstore-tour`](bookstore-tour/README.md). This SDD remains the core service contract; the WebFlux and advanced tracks are companion contracts rather than extra milestones hidden inside M11.
 
 ## Tech stack (current as of mid-2026)
 
 | Piece | Choice | Why |
 |---|---|---|
-| Spring Boot | **4.x** (Framework 7) | Baselines: Kotlin 2.2, Java 17+ (happily runs 21/25 — use **21+** to get virtual threads), Jakarta EE 11; Boot 3.5 hit OSS EOL June 2026 |
-| Kotlin | 2.2+ | K2 compiler; JSpecify interop |
+| Spring Boot | **4.1** (Framework 7) | Current project; Java 17+ baseline, Java 21 toolchain |
+| Kotlin | 2.3 | Current project; K2 compiler; JSpecify interop |
 | Build | Gradle Kotlin DSL | Type-safe, the Kotlin-shop default |
-| DB | PostgreSQL 16 (Docker Compose, auto-detected via `spring-boot-docker-compose`) | |
-| Migrations | Flyway | `ddl-auto=validate` |
-| Testing | JUnit 5 + MockK + Testcontainers + ArchUnit | |
+| Persistence | Spring Data JDBC | Kotlin-friendly immutable aggregate rows; blocking isolated in output adapters |
+| DB | PostgreSQL 18 (Docker Compose, auto-detected via `spring-boot-docker-compose`) | Matches `.env.example` |
+| Migrations | Flyway | Owns all DDL; Data JDBC does not generate schema |
+| Testing | JUnit Jupiter + `kotlinx-coroutines-test` + MockK + Testcontainers + ArchUnit | |
+| Coroutines (K1 onward) | core, test, reactor; SLF4J bridge only for explicit custom MDC | suspend/Flow in MVC; structured concurrency and virtual-time tests |
+| Non-blocking DB (M11 branch) | `spring-boot-starter-data-r2dbc` + `r2dbc-postgresql` | `CoroutineCrudRepository`; Flyway keeps a JDBC url |
 
-Bootstrap at start.spring.io → Kotlin, Gradle-Kotlin → **Web, Data JPA, Validation, PostgreSQL, Flyway, Actuator, Testcontainers, Docker Compose support**.
+Companion applications add WebFlux/R2DBC, Spring Modulith, Spring Kafka, and separate datastore/broker infrastructure only in the lesson where the business problem requires them. MVC/JDBC and WebFlux/R2DBC server stacks are not collapsed into one ambiguous starter application.
+
+Bootstrap at start.spring.io → Kotlin, Gradle-Kotlin → **Web, Data JDBC, Validation, PostgreSQL, Flyway, Actuator, Testcontainers, Docker Compose support**.
 
 ```kotlin
 plugins {
-    id("org.springframework.boot") version "4.0.x"
+    id("org.springframework.boot") version "4.1.x"
     id("io.spring.dependency-management") version "1.1.x"
-    kotlin("jvm") version "2.2.x"
-    kotlin("plugin.spring") version "2.2.x"  // ⭐ all-open for Spring proxies
-    kotlin("plugin.jpa") version "2.2.x"     // ⭐ no-arg ctor for Hibernate
+    kotlin("jvm") version "2.3.x"
+    kotlin("plugin.spring") version "2.3.x"  // ⭐ all-open for annotated/proxied Spring beans
 }
-kotlin { compilerOptions { freeCompilerArgs.add("-Xjsr305=strict") } }
+kotlin {
+    compilerOptions {
+        freeCompilerArgs.addAll("-Xjsr305=strict", "-Xannotation-default-target=param-property")
+    }
+}
 ```
 
 ```yaml
 # compose.yaml
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment: { POSTGRES_DB: bookstore, POSTGRES_USER: bookstore, POSTGRES_PASSWORD: secret }
     ports: ["5432:5432"]
 ```
@@ -342,24 +455,42 @@ order_items:  id, order_id (FK), book_id (FK), quantity, unit_price
 
 ---
 
+### ✅ K0 — Pure Kotlin modeling runway
+**Refreshes:** nullability, expressions, smart casts, `data`/regular/`value`/sealed classes, immutability, extension functions, collection transformations.
+
+Build `Isbn`, `Money`, a small identity-bearing class, and a sealed decision type. Test them with no Spring and no coroutines.
+
+### ✅ K1 — Structured concurrency runway
+**Refreshes:** `suspend`, `CoroutineScope`, `launch`/`Job`, `async`/`Deferred<T>`, `join`, `await`, `awaitAll`, `coroutineScope`.
+
+Tests must prove result retrieval, completion-only waiting, first failure, sibling cancellation, and the absence of `GlobalScope`/unowned tasks.
+
+### ✅ K2 — Context, cancellation, Flow, and coroutine testing
+**Refreshes:** injected dispatcher ownership, `withContext`, `Dispatchers.Default` vs blocking IO, `supervisorScope`, timeouts, cancellation, cold Flow/operators, `runTest` and virtual time.
+
+Only after K2 may a Spring controller or adapter use `suspend`/`Flow`.
+
+---
+
 ### ✅ M0 — Walking skeleton + typed configuration
 **Refreshes:** `@SpringBootApplication`, profiles, `@ConfigurationProperties`, Docker Compose integration.
 
-1. App boots against Postgres; Flyway runs V1; `ddl-auto=validate`.
-2. Bind config to an immutable class and enable with `@ConfigurationPropertiesScan`:
+1. Reconcile the checked-in Compose inputs: define or remove the referenced Redis image and replace PostgreSQL's invalid list-of-maps `environment` form. `docker compose --env-file .env.example config --quiet` must pass before boot is claimed.
+2. App boots against Postgres; Flyway runs V1; a `@DataJdbcTest` later proves the mapping against the migrated schema.
+3. Bind config to an immutable class and enable with `@ConfigurationPropertiesScan`:
 ```kotlin
 @ConfigurationProperties(prefix = "bookstore.orders")
 data class OrderProperties(val maxItemsPerOrder: Int = 10)
 ```
-3. Add `application-local.yml`; run with the profile.
+4. Add `application-local.yml`; run with the profile.
 
 **🎤** Constructor-bound `@ConfigurationProperties` data classes > `@Value`: type-safe, immutable, validatable (`@Validated` + jakarta annotations), metadata-discoverable.
 
 ### ✅ M1 — Domain core (pure Kotlin, zero Spring)
 **Refreshes:** Kotlin design muscle — `data class` vs class, sealed hierarchies, `init` invariants, `require`, value semantics.
 
-1. Write `domain.model`: `Book` (enforces positive price, non-negative stock, exposes `decreaseStock(qty)` that throws `InsufficientStockException`), `Order` + `OrderItem` (total computed from items), `OrderStatus` enum.
-2. Business exceptions in `domain.error`.
+1. Write feature domains: `catalog.domain.Book` owns stock behavior; `ordering.domain.Order`/`OrderItem` own order invariants.
+2. Domain behavior failures (for example insufficient stock) stay in domain; not-found and duplicate-use-case failures live in `application.error`.
 3. **Plain JUnit tests** — no Spring context, no mocks. `Order` math, stock rules, invariant violations.
 
 **The point:** this package would compile in a Ktor app, a CLI, or a Lambda unchanged. That's the hexagon's core, demonstrated.
@@ -367,29 +498,28 @@ data class OrderProperties(val maxItemsPerOrder: Int = 10)
 ### ✅ M2 — Ports + application services
 **Refreshes:** interfaces-as-contracts, constructor injection, DIP.
 
-1. Define `port.in` (use cases) and `port.out` (`BookRepositoryPort`, `OrderRepositoryPort`, `PriceCheckPort`) as Kotlin interfaces with **nullable returns instead of `Optional`** (`fun findByIsbn(isbn: String): Book?`).
-2. Implement `BookService`, `PlaceOrderService` against the ports. Enforce `maxItemsPerOrder` from M0's properties here.
-3. Unit test with MockK against the ports — the last-copy scenario, duplicate ISBN, item-limit breach — still no Spring context.
+1. Define `port.input` and `port.output` (`BookRepositoryPort`, `OrderCommitPort`, `PriceCheckPort`) with nullable/suspend contracts instead of `Optional` or exposed `Deferred<T>`.
+2. Implement use cases as `@Service` classes. Bootstrap maps `OrderProperties` into an application-owned `OrderPolicy`; application never imports the bootstrap type.
+3. Unit test the annotated classes directly with MockK `coEvery`/`coVerify` and `runTest` — no Spring context.
 
 **🎤** Constructor injection over field injection: immutability (`val`), can't exist in an invalid state, trivially testable, circular deps fail fast — and in Kotlin, field injection would force `lateinit var`, surrendering null-safety.
 
-### ✅ M3 — Persistence adapter (the Kotlin/JPA minefield)
-**Refreshes:** `@Entity`, `@Version`, auditing, Spring Data repositories, entity↔domain mapping.
+### ✅ M3 — Spring Data JDBC output adapter
+**Refreshes:** `@Table`, `@Id`, `@Version`, `@MappedCollection`, auditing, immutable row↔domain mapping.
 
-1. `BookJpaEntity` as a **normal class** (see ADR-010 for the full data-class indictment):
+1. `BookRow` as an immutable persistence data class:
 ```kotlin
-@Entity @Table(name = "books")
-class BookJpaEntity(
-    @Id @GeneratedValue(strategy = GenerationType.IDENTITY) val id: Long? = null,
-    @Column(nullable = false, unique = true) var isbn: String,
-    var title: String, var author: String,
-    var price: BigDecimal, var stock: Int,
-    @Version var version: Long = 0,
+@Table("books")
+data class BookRow(
+    @Id val id: Long? = null,
+    val isbn: String, val title: String, val author: String,
+    val price: BigDecimal, val stock: Int,
+    @Version val version: Long? = null,
 )
 ```
-2. Auditing: `@CreatedDate`/`@LastModifiedDate` + `@EntityListeners(AuditingEntityListener::class)` + `@EnableJpaAuditing`.
-3. `SpringDataBookRepository : JpaRepository<BookJpaEntity, Long>` stays `internal` to the adapter package; `BookPersistenceAdapter` implements `BookRepositoryPort` and maps with `fun BookJpaEntity.toDomain(): Book` / `fun Book.toEntity(): BookJpaEntity`.
-4. `@DataJpaTest` + Testcontainers `@ServiceConnection` — one annotation, real Postgres, no H2 lies.
+2. Auditing: `@CreatedDate`/`@LastModifiedDate` + `@EnableJdbcAuditing`.
+3. The internal `CrudRepository<BookRow, Long>` needs no decorative stereotype. `@Repository BookPersistenceAdapter` implements the output port, owns `withContext(jdbcDispatcher)`, and maps rows/domain.
+4. `@DataJdbcTest` + Testcontainers `@ServiceConnection` — real Postgres, no H2 assumptions.
 
 ### ✅ M4 — Web adapter: CRUD + DTOs + validation
 **Refreshes:** `@RestController`, mapping annotations, `@Valid`, `ResponseEntity`, the `@field:` trap.
@@ -411,7 +541,7 @@ data class CreateBookRequest(
 ### ✅ M5 — Centralized errors with ProblemDetail
 **Refreshes:** `@RestControllerAdvice`, `@ExceptionHandler`, RFC 9457.
 
-Map: `BookNotFoundException`→404 · `DuplicateIsbnException`→409 · `MethodArgumentNotValidException`→400 with field-error map in `properties` · `ObjectOptimisticLockingFailureException`→409 · fallback `Exception`→500 generic (never leak stack traces). Verify the JSON shape (`type`, `title`, `status`, `detail`) in tests.
+Map: `BookNotFoundException`→404 · `DuplicateIsbnException`→409 · `MethodArgumentNotValidException`→400 with field errors · `OptimisticLockingFailureException`→409 · fallback `Exception`→500 generic. Verify the JSON shape.
 
 ### ✅ M6 — Logging done properly
 **Refreshes:** SLF4J idioms in Kotlin, levels, MDC.
@@ -419,33 +549,33 @@ Map: `BookNotFoundException`→404 · `DuplicateIsbnException`→409 · `MethodA
 1. Pick and defend a logger idiom: companion-object `LoggerFactory.getLogger(...)` or a reified top-level helper `inline fun <reified T> T.logger(): Logger`.
 2. Parameterized messages — `log.info("Book created id={}", id)` — never `"$id"` interpolation (evaluated even when the level is off).
 3. `OncePerRequestFilter` that seeds **MDC** with a `requestId`; `%X{requestId}` in the pattern. That's the "trace one request across logs" answer.
-4. `logging.level.org.hibernate.SQL=debug` in the local profile; know why `show-sql=true` is worse (bypasses the log system).
+4. Enable `org.springframework.jdbc.core` SQL logging only in the local profile; never log credentials or sensitive values.
 
 ### ✅ M7 — Pagination, sorting, filtering
 **Refreshes:** `Pageable`, `Page<T>`, derived queries, `@Query`.
 
 1. `GET /api/v1/books?page=0&size=20&sort=title,asc` — controller takes `Pageable`, maps `page.map { it.toResponse() }`, cap size at 100.
-2. Filters: one derived query (`findByAuthorContainingIgnoreCase`) + one JPQL `@Query` with `@Param` — both styles refreshed.
+2. Filters: one derived query (`findByAuthorContainingIgnoreCase`) + one SQL `@Query` — both styles refreshed.
 3. Hexagonal wrinkle: the input port speaks a tiny `PageQuery`/`PagedResult` pair, the adapter translates to Spring's `Pageable`. Feel the cost, understand the shortcut (ADR-009).
 
 ### ✅ M8 — Orders: transactions + optimistic locking (the meaty one)
-**Refreshes:** `@Transactional`, propagation, `@Version` conflicts, `@Enumerated(STRING)`, associations, lazy-loading.
+**Refreshes:** suspend orchestration, remote fan-out before transactions, proxied imperative `@Transactional`, `@Version`, Data JDBC aggregate ownership.
 
-1. `PlaceOrderService.place()` in **one transaction**: load books → price-check via `PriceCheckPort` → validate stock → decrement → compute total → persist order + items. Any failure rolls back all of it.
-2. Business rules → business exceptions → advice: `InsufficientStockException`→409, item limit→400.
-3. Two-thread test proving the last-copy race yields exactly one success and one 409.
-4. `GET /orders/{id}`: dodge `LazyInitializationException` — map to DTO *inside* the transaction or fetch-join.
-5. All ADR-006 talking points apply (self-invocation, rollback rules, `readOnly`).
+1. `@Service PlaceOrderService.place()` validates and obtains price/rating data with structured coroutines before opening a DB transaction.
+2. `OrderCommitPort` is implemented by an `@Repository` adapter that dispatches blocking work and calls a separate imperative `@Transactional` delegate on the same thread.
+3. That delegate loads versioned rows, maps to domain, applies stock behavior, and persists the aggregate atomically.
+4. Two-thread test proves exactly one last-copy success and one 409.
+5. Stable enum converters and `@MappedCollection` replace JPA ordinals/lazy associations.
 
 ### ✅ M9 — Tests completed + ArchUnit
 Fill the pyramid per ADR-011 and add the architecture tests:
 
 ```kotlin
-@AnalyzeClasses(packages = ["com.example.bookstore"])
+@AnalyzeClasses(packages = ["com.example.kotlinrefresher"])
 class HexagonalRulesTest {
     @ArchTest val domainIsPure = noClasses().that().resideInAPackage("..domain..")
         .should().dependOnClassesThat().resideInAnyPackage(
-            "org.springframework..", "jakarta.persistence..", "..adapter..")
+            "org.springframework..", "jakarta..", "org.springframework.data..", "..adapter..", "..application..")
 }
 ```
 
@@ -454,9 +584,24 @@ class HexagonalRulesTest {
 
 1. **Native API versioning:** enable a strategy in `WebMvcConfigurer.configureApiVersioning` (header `X-API-Version` or media-type param) and ship `GET /books/{id}` as `version = "1.0"` and `"1.1"` (v1.1 adds a field). Mention RFC 9745 deprecation support.
 2. **HTTP interface client:** the price-check adapter per ADR-008 — `@GetExchange` interface + `@ImportHttpServices`.
-3. **In-framework resilience:** `@Retryable` (backoff + jitter) on the price-check adapter; `@ConcurrencyLimit` where a bulkhead makes sense.
-4. **Virtual threads:** `spring.threads.virtual.enabled=true`; then, for contrast, convert the price-check orchestration to a `suspend` flow with `coroutineScope` fan-out and articulate ADR-007 out loud.
+3. **Execution-model-aware resilience:** reactive `@Retryable` on the WebClient delegate, coroutine `Semaphore` around the suspend port adapter, `@ConcurrencyLimit` on the synchronous comparison adapter, and `@EnableResilientMethods` in bootstrap.
+4. **Virtual threads:** enable them on the explicit imperative comparison profile, not as a hidden replacement for the coroutine main line.
 5. **RestTestClient** (new in 7.0) in one adapter test.
+
+### ✅ M11 — Apply the coroutine runway and compare runtimes
+**Refreshes:** suspend MVC, structured fan-out, adapter-owned JDBC dispatcher, Flow media-type behavior, virtual-thread comparison, `CoroutineCrudRepository`.
+
+Prereqs: `kotlinx-coroutines-reactor`, Micrometer context propagation, optional `kotlinx-coroutines-slf4j` for custom MDC, and the R2DBC starter/driver only on the comparison branch.
+
+Apply the already-learned Kotlin model first, then diff the imperative alternative:
+
+1. **Suspend end to end** — `GET /api/v1/books/{isbn}/enriched` as `suspend` controller → suspend input port → suspend adapters. The traditional twin lives in the comparison profile with parallel imperative port types; do not call suspend ports through `runBlocking`. *The diff is the signatures*: coroutines color contracts, while switching an already-imperative implementation from platform to virtual threads changes no signatures.
+2. **Fan-out** — price + rating in parallel: ADR-007's code pair. *Failure semantics are the headline*: a failed `async` cancels its sibling by construction; the `CompletableFuture` twin leaks it unless you cancel manually.
+3. **Bridging Data JDBC** — `@Repository` owns `withContext(jdbcDispatcher)`; the transaction delegate stays imperative and proxied. Compare with a virtual-thread adapter. This isolates blocking; only R2DBC removes it.
+4. **Streaming** — the output port returns `Flow<Book>` (note: the method itself is not `suspend` — a cold `Flow` is a recipe, not a result); the controller returns `Flow<BookResponse>` with `produces = APPLICATION_NDJSON_VALUE`. Compare against M7 pagination and argue which *contract* a catalog actually wants. Know the trap: the same handler on `application/json` collects instead of streaming.
+5. **R2DBC branch line** (ADR-012) — catalog reads via `CoroutineCrudRepository`: suspend + `Flow` with no `withContext` anywhere, because nothing blocks. Re-run the last-copy race and watch `@Version` still deliver the 409.
+
+Wrap-up drill: prove Boot/Micrometer context propagation after a suspension; add an accessor or explicit `MDCContext` for a custom MDC key.
 
 ### 🌶️ Stretch (30–60 min each)
 - **Actuator hardening:** expose only `health,info,metrics`; custom `HealthIndicator` (book count > 0).
@@ -474,9 +619,11 @@ class HexagonalRulesTest {
 | Annotation | One-liner |
 |---|---|
 | `@SpringBootApplication` | `@Configuration` + `@EnableAutoConfiguration` + `@ComponentScan` |
-| `@Component/@Service/@Repository` | Stereotypes; `@Repository` also translates persistence exceptions |
+| `@Component` | Generic component-scan stereotype for adapters/infrastructure with no narrower semantic role |
+| `@Service` | Application use-case implementation; communicates orchestration intent and supports proxying |
+| `@Repository` | Persistence output adapter; communicates role, while Spring Data proxies translate synchronous JDBC failures |
 | `@RestController` | `@Controller` + `@ResponseBody` |
-| `@Valid` vs `@Validated` | Jakarta trigger vs Spring's (groups, class-level method validation) |
+| `@Valid` vs `@Validated` | Jakarta validation/cascade trigger vs Spring method validation and validation groups |
 | `@Transactional` | Proxy-based tx boundary; self-invocation & rollback rules |
 | `@Version` | Optimistic locking column |
 | `@ConfigurationProperties` | Typed, constructor-bound config binding |
@@ -485,80 +632,135 @@ class HexagonalRulesTest {
 | `@ServiceConnection` | Wires a Testcontainer into the context automatically |
 | `@HttpExchange` / `@GetExchange` | Declarative HTTP interface client (Spring-native "Retrofit") |
 | `@ImportHttpServices` | Boot 4: one-annotation registration of HTTP interfaces |
-| `@Retryable` / `@ConcurrencyLimit` | Framework 7 in-core resilience (retry w/ backoff; bulkhead) |
+| `@Retryable` / `@ConcurrencyLimit` | Framework 7 retry and synchronous invocation bulkhead; execution-model semantics matter |
+| `@EnableResilientMethods` | Activates Framework 7 resilient-method interception |
 | `@GetMapping(version = "1.1")` | Framework 7 first-class API versioning |
+
+## The two-dialect phrasebook (M11 — same intent, both tracks)
+
+| Intent | Pure Kotlin (coroutines) | Traditional Spring Boot |
+|---|---|---|
+| Handler that waits on IO | `suspend fun` controller method | plain method on a virtual thread |
+| Parallel fan-out | `coroutineScope { async { } }` | `CompletableFuture.supplyAsync(work, vtExecutor)` — someday `StructuredTaskScope` |
+| Calling blocking code | adapter-owned `withContext(jdbcDispatcher) { … }` | call it directly; the virtual thread parks |
+| Cancel siblings on failure | automatic inside `coroutineScope` | manual `cancel(true)` wiring |
+| Many results, streamed | `Flow<T>` + NDJSON/SSE | `Page<T>` batches (or `StreamingResponseBody`) |
+| Blocking relational repository | `CrudRepository` (Data JDBC) behind the dispatcher-owning adapter | `CrudRepository` called on a virtual thread |
+| Non-blocking relational repository | `CoroutineCrudRepository` (R2DBC) | no JDBC equivalent; changing threads does not remove blocking |
+| Bulkhead a remote call | coroutine `Semaphore.withPermit` | `@ConcurrencyLimit(limitString = "…")` around the synchronous invocation |
+| Correlation id propagation | Boot/Micrometer propagation; explicit accessor or `MDCContext` for custom MDC keys | `ThreadLocal` remains on the request virtual thread |
 
 ## Rapid-fire questions (answer out loud while building)
 
-*Original fourteen:*
-1. Why does Kotlin need `plugin.spring` and `plugin.jpa`? What breaks without each?
-2. Why not data classes for JPA entities? Where *should* you use them?
-3. Constructor vs field injection — three reasons, plus the Kotlin-specific one.
-4. What does `@field:` do and what silently fails without it?
-5. How does `@Transactional` work? The self-invocation pitfall?
-6. Optimistic vs pessimistic locking — when each; `@Version` conflict behavior?
-7. Why Flyway + `ddl-auto=validate` over `ddl-auto=update`?
-8. `Page` vs `Slice`? What extra SQL does `Page` run? (count query)
-9. How do you trace one request across log lines? (MDC / correlation id)
-10. N+1: how to detect; two fixes (fetch join, `@EntityGraph`).
-11. Platform types; what do `-Xjsr305=strict` / JSpecify change in Boot 4?
-12. MockK vs Mockito for Kotlin — why?
-13. `RestClient` vs `RestTemplate` vs `WebClient` — which for a new blocking MVC app?
-14. Coroutines vs virtual threads for a Spring MVC service.
+*Kotlin language and concurrency:*
+1. When should a type be a `data class`, regular class, `value class`, or `sealed interface`?
+2. What is the difference between `launch`/`Job` and `async`/`Deferred<T>`?
+3. What does `Deferred.join()` return, and when must you use `await()` instead?
+4. How does `awaitAll()` fail differently from awaiting deferred values one at a time?
+5. One `async` fails inside `coroutineScope`: what happens to its sibling? How does `supervisorScope` differ?
+6. Where is cancellation cooperative, and why must `CancellationException` be rethrown?
+7. Why is `runBlocking` acceptable at a process/test boundary but not in a request handler?
+8. Why inject a dispatcher or execution policy instead of hard-coding `Dispatchers.IO` in use cases?
+9. Why is a cold `Flow<T>`-returning function normally not itself `suspend`?
+10. When should an API return a collection, page, `Flow`, NDJSON, or SSE?
 
-*New — architecture round:*
-15. State the hexagonal dependency rule in one sentence. How do you *enforce* it?
-16. Input ports vs output ports — which are you willing to drop under pressure, and why?
-17. Why is `FooServiceImpl` with one implementation an anti-pattern in Spring/Kotlin?
-18. Your domain model and JPA entities are separate classes. Defend the mapping cost.
-19. Where does `@Transactional` live in a hexagonal app and what's the purist objection?
-20. How would you add a GraphQL API to this system? What changes? (Answer: one new inbound adapter; nothing else.)
-21. Retrofit vs Spring HTTP interfaces on the server — what did Framework 6/7 change?
-22. What's new in Spring Framework 7 / Boot 4? (API versioning, JSpecify null-safety, in-framework resilience, Jackson 3, modularized starters, `RestTestClient`.)
-23. Spring's `Pageable` at the use-case boundary: leak or pragmatism? Argue both sides.
-24. How do virtual threads change the argument for `@ConcurrencyLimit` / bulkheads?
+*Spring, annotations, and architecture:*
+11. Why does the main line need `plugin.spring` but not `plugin.jpa`?
+12. What does `-Xannotation-default-target=param-property` solve, and when is an explicit `@field:` still clearer?
+13. Constructor versus field injection: what are the Kotlin-specific advantages?
+14. State the hexagonal dependency rule in one sentence. How is it enforced?
+15. Why are packages named `input`/`output`, not `in`/`out`, in Kotlin?
+16. Why may application use cases be `@Service` while domain types remain annotation-free?
+17. When should an output adapter be `@Repository` versus `@Component`?
+18. Why is `FooServiceImpl` with one implementation usually ceremony?
+19. Where does `@Transactional` live here, and why is the transactional delegate a separate proxied bean?
+20. How would a GraphQL adapter reuse the same input ports?
+
+*Persistence, web, and operations:*
+21. Why does Flyway own DDL when Spring Data JDBC does no schema generation?
+22. How do Spring Data JDBC aggregates and `@MappedCollection` constrain ownership?
+23. Why keep domain objects separate from persisted rows despite the mapping cost?
+24. Optimistic versus pessimistic locking: when each, and how does `@Version` become a `409`?
+25. `Page` versus `Slice`: what extra SQL does `Page` usually require?
+26. Why must external price checks finish before the database transaction starts?
+27. What belongs in `@RestControllerAdvice`, and what remains a domain/application error?
+28. `RestClient` versus `WebClient`: which one supports the suspending main line without hiding a block?
+29. What enables Spring Framework resilience annotations, why is `@ConcurrencyLimit` not a suspend-operation bulkhead, and why is retry around the whole order transaction dangerous?
+30. How is a correlation id preserved after coroutine suspension, especially for custom MDC keys?
+
+*Runtime comparison:*
+31. What does `withContext(jdbcDispatcher)` do to JDBC — and what does it not do?
+32. Why must a thread-bound JDBC transaction avoid suspension/thread switches?
+33. What decides whether a controller-returned `Flow<T>` streams or is collected?
+34. Which dependencies let Spring MVC adapt `suspend` and `Flow` handlers?
+35. What changes between Data JDBC and R2DBC, and what stays the same?
+36. How do coroutines, virtual threads, and non-blocking drivers change three different dials?
 
 # PART V — DEFINITION OF DONE
 
-- [ ] App boots via Docker Compose Postgres; Flyway migrates; `ddl-auto=validate`
-- [ ] `domain` package has **zero** Spring/JPA imports — proven by an ArchUnit test
+- [ ] K0–K2 exercises prove Kotlin modeling, `Job`/`Deferred<T>`, `join`/`await`/`awaitAll`, cancellation, supervision, dispatcher choice, `Flow`, and `runTest`
+- [ ] App boots via Docker Compose Postgres 18; Flyway owns and applies every schema change
+- [ ] `domain` packages have **zero framework imports** — proven by an ArchUnit test
 - [ ] Domain + application layers fully unit-tested without a Spring context
+- [ ] Annotation policy is consistent: `@RestController` inbound, `@Service` use cases, `@Repository` persistence adapters, `@Component` other adapters
 - [ ] Full Book CRUD through the web adapter: DTOs, validation, 201/204/404/409
 - [ ] Every error is an RFC 9457 `ProblemDetail` from one advice class
 - [ ] `requestId` in every log line via MDC
 - [ ] Paged + filtered listing, size capped, port speaks `PageQuery` not `Pageable`
-- [ ] Transactional order placement; two-thread test proves optimistic-lock 409
-- [ ] Price check goes through an HTTP interface client behind `PriceCheckPort`, with `@Retryable`
+- [ ] Suspend order orchestration finishes remote calls before a short Data JDBC transaction; a two-request test proves optimistic-lock 409
+- [ ] Price check goes through a WebClient HTTP interface behind `PriceCheckPort`; reactive `@Retryable` and coroutine `Semaphore` behavior are tested
+- [ ] `@EnableResilientMethods` activates retry/concurrency annotations; `@ConcurrencyLimit` is confined to the synchronous comparison and resource limits are documented
 - [ ] One endpoint served in two versions via Spring 7 native API versioning
-- [ ] Virtual threads enabled; you can argue ADR-007 for two minutes unprompted
-- [ ] ≥1 MockK unit test, ≥1 `@WebMvcTest`, ≥1 Testcontainers integration test, ≥1 ArchUnit test
-- [ ] You can answer all 24 rapid-fire questions without looking
+- [ ] Virtual threads exist only in the imperative comparison profile; you can argue ADR-007 for two minutes unprompted
+- [ ] M11: enrichment exists in both dialects — `coroutineScope`/`async` first, `CompletableFuture` on virtual threads second — and you can diff their failure semantics out loud
+- [ ] M11: a `Flow<T>` endpoint streams NDJSON, and you can explain the `application/json` collect trap
+- [ ] M11: the `r2dbc-comparison` branch serves catalog reads with `CoroutineCrudRepository`, reproduces the `@Version` 409, and keeps Flyway on JDBC
+- [ ] ≥1 `runTest`/MockK unit test, ≥1 `@WebMvcTest`, ≥1 `@DataJdbcTest`, ≥1 Testcontainers integration test, and ≥1 ArchUnit test
+- [ ] You can answer all 36 rapid-fire questions without looking
+
+**Companion curriculum completion is tracked separately:**
+
+- [ ] Fulfillment API streams durable, authorized tracking updates with WebFlux, R2DBC, `Flow`, SSE, cancellation, and measured subscriber limits
+- [ ] Domain events are mapped to versioned integration events and published through a durable publication/outbox mechanism
+- [ ] Kafka consumers prove inbox/business idempotency, retry/DLT policy, partition ordering, and independent consumer-group behavior
+- [ ] Distributed checkout exposes a `202 Accepted` operation and both Saga variants pass the same happy-path, rejection, timeout, restart, duplicate, and failed-compensation matrix
+- [ ] The orchestrated variant persists coordinator state and never models a cross-service Saga as a long-running coroutine
+- [ ] Event sourcing remains selective to fulfillment; event-store replay rebuilds aggregate state and CQRS projections without repeating external side effects
 
 ---
 
 # References (research trail)
 
-**Spring Framework 7 / Boot 4 features**
-- InfoQ — *Spring Framework 7 and Spring Boot 4 Deliver API Versioning, Resilience, and Null-Safe Annotations*: https://www.infoq.com/news/2025/11/spring-7-spring-boot-4/
-- InfoQ — *The Spring Team on Spring Framework 7 and Spring Boot 4* (interview): https://www.infoq.com/articles/spring-team-spring-7-boot-4/
-- Spring Framework 7.0 Release Notes: https://github.com/spring-projects/spring-framework/wiki/Spring-Framework-7.0-Release-Notes
-- Dan Vega — *What's New in Spring Framework 7 and Spring Boot 4*: https://www.danvega.dev/blog/spring-boot-4-is-here
-- Baeldung — *Spring Boot 4 & Spring Framework 7 – What's New*: https://www.baeldung.com/spring-boot-4-spring-framework-7
+**Primary documentation — Kotlin and coroutines**
+- Kotlin — *Coroutines basics*: https://kotlinlang.org/docs/coroutines-basics.html
+- Kotlin API — `Deferred<T>` (`join`, `await`, failure semantics): https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-deferred/
+- Kotlin API — `Dispatchers.IO`: https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-i-o.html
+- Kotlin — *Asynchronous Flow*: https://kotlinlang.org/docs/flow.html
 
-**Hexagonal architecture with Spring + Kotlin**
-- Arho Huttunen — *Hexagonal Architecture With Spring Boot* (incl. the JPA tension & pagination discussion): https://www.arhohuttunen.com/hexagonal-architecture-spring-boot/
-- Hieu Nguyen (Medium) — *Hexagonal Architecture in Practice: Spring Boot + Kotlin*: https://medium.com/@hieunv/understanding-hexagonal-architecture-through-a-practical-application-2f2d28f604d9
-- Gaurav Kumar (Medium) — *Hexagonal Architecture in Kotlin Spring: A Quick Guide*: https://medium.com/@slashgkr/hexagonal-architecture-in-kotlin-spring-a-quick-guide-a5ecdc3c4c95
-- Reference repo (multi-module, ArchUnit-enforced): https://github.com/dustinsand/hex-arch-kotlin-spring-boot
+**Primary documentation — Spring Boot and Spring Framework**
+- Spring Boot — *Kotlin support*: https://docs.spring.io/spring-boot/reference/features/kotlin.html
+- Spring — *Building web applications with Spring Boot and Kotlin*: https://spring.io/guides/tutorials/spring-boot-kotlin/
+- Spring Framework — *Coroutines*: https://docs.spring.io/spring-framework/reference/languages/kotlin/coroutines.html
+- Spring MVC — *Asynchronous requests*: https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-async.html
+- Spring Framework — *HTTP interface client*: https://docs.spring.io/spring-framework/reference/integration/rest-clients.html#rest-http-interface
+- Spring Framework — *Resilience*: https://docs.spring.io/spring-framework/reference/core/resilience.html
+- Spring Framework — *Component scanning and stereotype annotations*: https://docs.spring.io/spring-framework/reference/core/beans/classpath-scanning.html
+- Spring Framework — *Spring projects in Kotlin (`kotlin-spring`/all-open)*: https://docs.spring.io/spring-framework/reference/languages/kotlin/spring-projects-in.html
+- Spring Boot — *Build systems and Boot 4's WebClient starter*: https://docs.spring.io/spring-boot/reference/using/build-systems.html
+- Spring Data Relational — *Spring Data JDBC*: https://docs.spring.io/spring-data/relational/reference/jdbc.html
+- Spring Data Relational — *Spring Data R2DBC*: https://docs.spring.io/spring-data/relational/reference/r2dbc.html
+- Spring Framework — *Spring WebFlux*: https://docs.spring.io/spring-framework/reference/web/webflux.html
+- Spring Modulith — *Application events and externalization*: https://docs.spring.io/spring-modulith/reference/events.html
+- Spring Kafka — *Transactions*: https://docs.spring.io/spring-kafka/reference/kafka/transactions.html
+- AWS Prescriptive Guidance — *Saga patterns*: https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/saga-patterns.html
+- Azure Architecture Center — *Event-driven architecture*: https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/event-driven
+- Azure Architecture Center — *Event sourcing*: https://learn.microsoft.com/en-us/azure/architecture/patterns/event-sourcing
+
+**Secondary perspectives and comparison material**
+- JetBrains — *Strategic partnership with Spring* (industry adoption and Kotlin/Spring direction): https://blog.jetbrains.com/kotlin/2025/05/strategic-partnership-with-spring/
+- InfoQ — *The Spring Team on Spring Framework 7 and Spring Boot 4*: https://www.infoq.com/articles/spring-team-spring-7-boot-4/
+- Arho Huttunen — *Hexagonal Architecture With Spring Boot*: https://www.arhohuttunen.com/hexagonal-architecture-spring-boot/
 - codecentric — *Spring Modulith with Kotlin and hexagonal architecture*: https://www.codecentric.de/en/knowledge-hub/blog/modularization-the-easy-way-spring-modulith-with-kotlin-and-hexagonal-architecture
-
-**Concurrency: coroutines vs virtual threads**
-- JDriven — *From Java to Kotlin Part X: Virtual Threads and Coroutines* (2026): https://jdriven.com/blog/2026/02/Java-To-Kotlin-Series-10-Threads
-- Jorge Gonzalez (Medium) — *Comparing Kotlin Coroutines and Java Virtual Threads with Spring Boot Examples*: https://medium.com/@jorgegfx/harnessing-modern-concurrency-comparing-kotlin-coroutines-and-java-virtual-threads-with-spring-cf79e234b892
-- Kotlin Discussions — *Spring, Coroutines, Virtual Threads*: https://discuss.kotlinlang.org/t/spring-coroutines-virtual-threads/29949
-- Benchmarks repo (coroutine vs Reactor vs virtual threads): https://github.com/gaplo917/coroutine-reactor-virtualthread-microbenchmark
-
-**HTTP clients**
-- MEsfandiari (Medium) — *The End of RestTemplate: Spring RestClient vs. WebClient vs. Retrofit in 2026*: https://medium.com/@mesfandiari77/the-end-of-resttemplate-spring-restclient-vs-webclient-vs-retrofit-in-2026-0ca96c463544
+- Coroutine/Reactor/virtual-thread benchmark repository: https://github.com/gaplo917/coroutine-reactor-virtualthread-microbenchmark
 
 Build it once without AI autocomplete, narrating your decisions out loud like it's the interview. 🚀
